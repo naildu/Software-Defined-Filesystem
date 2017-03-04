@@ -1,0 +1,187 @@
+#ifndef _LINUX_EEXT4_H
+#define _LINUX_EEXT4_H
+
+#include <linux/list.h>
+#include <linux/spinlock.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/random.h>
+#include "ext4_jbd2.h"
+
+extern int EEXT4_ONLINE_DEVICE_NUM;
+extern int CPU_CORE_NUM;
+
+#define EEXT4_SPANDIR_NUM 128
+
+#define RANDOM_FACTOR (EEXT4_SPANDIR_NUM / CPU_CORE_NUM)
+//#define EEXT4_DEBUG 1
+
+#define EEXT4_DEVICE_NUM_MIN	1
+#define EEXT4_DEVICE_NUM_MAX	128
+
+//rename constants
+#define EEXT4_DEVICE_MASK_MASK	0x3f
+#define EEXT4_RENAME_TAG_NULL	0x00
+#define EEXT4_RENAME_TAG_COMMON	0x80
+#define EEXT4_RENAME_TAG_NEWENTRY	0x40
+
+#define EEXT4_LOCAL 0
+#define EEXT4_REMOTE 1
+
+//#define DEBUG
+
+struct eext4_entry_info {
+	struct dentry	*spandir_dentry;
+};
+	
+//represents an eext4 device
+struct eext4_device {
+	struct super_block	*sb;
+
+	struct dentry		*device_root;
+	struct dentry		**SPANDir;
+	int					nr;
+	//struct inode		*device_root_inode;
+};
+
+/*the convenient structure for parameter passing in the eext4_rename routine*/
+struct eext4_four_devices {
+	char	old_dir_device;
+	char	old_inode_device;
+	char	new_dir_device;
+	char	new_inode_device;
+	void * 	saved_info;
+};
+
+/* super.c */
+//the device array;
+extern struct eext4_device	*eext4_devices[EEXT4_DEVICE_NUM_MAX];
+extern struct dentry* eext4_rd_uvlroot;
+extern const char *partition_opt;
+extern const int partition_opt_len;
+extern unsigned int round_robin_counter;
+
+//eext4_inode_lookup reverse dentry list
+struct dentry_node {
+	struct dentry *dentry;
+	struct dentry_node *next;
+};
+
+//get the device number of the directory;
+#define EEXT4_INODE_DEVICE(inode) \
+	(EXT4_SB (inode->i_sb)->eext4_sb_info_id)
+
+
+
+#define ASSERT(expr)						\
+		if (unlikely(!(expr))) {				\
+			printk(KERN_ERR "\nAssertion failure in %s() "	\
+						"at line %d:\n\n"	\
+					"\trbd_assert(%s);\n\n",	\
+					__func__, __LINE__, #expr);	\
+			BUG();						\
+		}
+
+
+static inline int get_span_index(void) {
+	unsigned char tmp;
+	
+	get_random_bytes(&tmp, sizeof(unsigned char));
+	tmp = tmp % RANDOM_FACTOR;
+	return task_cpu(current) + tmp * CPU_CORE_NUM;
+}
+	
+
+static struct eext4_device *eext4_alloc_device (void) {
+	return (struct eext4_device*) kzalloc(sizeof (struct eext4_device), GFP_KERNEL);
+}
+
+static void eext4_kfree_device (struct eext4_device *device) {
+	kfree (device);
+}
+
+//Here eext4 decides now where to put the new object;
+//whether by the current cpu number, or incorporating the 
+//round-robin manner with a global counter;
+static char eext4_placement_police (struct inode *inode) {
+	//return ((round_robin_counter++) % EEXT4_ONLINE_DEVICE_NUM);
+	return ((EXT4_I(inode)->i_rr_counter++) % EEXT4_ONLINE_DEVICE_NUM);
+}
+
+static inline struct inode *eext4_find_spandir(struct dentry **spandir, u32 spandir_ino)
+{
+	int nr = EEXT4_SPANDIR_NUM;
+	int i;
+	
+	//eext4_warning("spandir number %d pino %d\n", nr, spandir_ino);
+	ASSERT(spandir_ino - 11 < EEXT4_SPANDIR_NUM);
+	return spandir[spandir_ino - 11]->d_inode;
+}
+
+static void eext4_warning(const char *fmt, ...)
+{
+	struct va_format vaf;
+	va_list args;
+	
+#ifdef EEXT4_DEBUG
+	va_start(args, fmt);
+	vaf.fmt = fmt;
+	vaf.va = &args;
+
+	printk(KERN_WARNING "EEXT4-fs: %pV", &vaf);
+
+	va_end(args);
+#endif
+}
+
+static int eext4_deviceid_valid (__u8 device) {
+	return device >= EEXT4_DEVICE_NUM_MIN && device <= EEXT4_ONLINE_DEVICE_NUM;
+}
+
+static struct inode * eext4_map_spandir (__u8 remote_device) {
+	if (!eext4_deviceid_valid (remote_device + 1))
+		eext4_warning("eext4_map_spandir deviceid invalid: %u\n", remote_device);
+
+	return eext4_devices[remote_device]->SPANDir[get_span_index()]->d_inode;
+}
+
+static void eext4_get_spandir (struct inode *spandir) {
+	mutex_lock_nested (&spandir->i_mutex, I_MUTEX_PARENT2);
+}
+
+static void eext4_put_spandir (struct inode *spandir) {
+	mutex_unlock (&spandir->i_mutex);
+}
+
+static void eext4_sync_dir (struct inode *dir, unsigned int *i_flags) {
+	*i_flags = dir->i_flags;
+	dir->i_flags |= S_DIRSYNC;
+}
+
+static void eext4_unsync_dir (struct inode *dir, unsigned int *i_flags) {
+	dir->i_flags = *i_flags;
+}
+
+/*check whether the entry matches in the three fields: device_mask, pinode, inode
+**it seems that the chat type is signed!!
+**130 in __u8: 10000010 when passed in could be intepreted as -01111110, which is -126
+**/
+static int eext4_entry_match (struct ext4_dir_entry_2 *de, __u8 device_mask, unsigned long pinode, unsigned long inode) {
+	if (le32_to_cpu (de->device_mask) == device_mask && 
+		le32_to_cpu (de->pinode) == pinode &&
+		le32_to_cpu (de->inode) == inode)
+		return 1;
+
+	return 0;
+}
+
+static int eext4_ordered_submission_journal_stop (handle_t *handle) {
+	ext4_handle_sync(handle);
+	return ext4_journal_stop(handle);
+}
+
+extern struct dentry *lookup_one_len (const char *name, struct dentry *base, int len);
+
+/* namei.c  */
+extern struct dentry *eext4_lookup_one_len (struct dentry *dentry, const char *name);
+#endif
